@@ -147,7 +147,7 @@
       "failure": "非法字幕保存被拒",
       "steps": [
         "入口解码与领域事实读取",
-        "重复源出现各自映射、区间求交且文本转义",
+        "重复源出现各自映射、区间求交且文本转义；成片时间字幕组另行处理",
         "WebVTT及成片区间"
       ],
       "module_ids": [
@@ -424,6 +424,90 @@
         "journal"
       ],
       "verification": "python3 scripts/workflow_check.py --workflow events"
+    },
+    {
+      "id": "multilingual-captions",
+      "name": "multilingual-captions",
+      "entry": "PUT /forge/v1/caption-groups/{id}/languages/{language}",
+      "success": "各语言独立修订及共同确认画面",
+      "failure": "越界或同语言重叠字幕保存被拒",
+      "steps": [
+        "入口解码与领域事实读取",
+        "语言按确认成片时间分句保存，组修订固定画面与各语言修订",
+        "各语言独立修订及共同确认画面"
+      ],
+      "module_ids": [
+        "http",
+        "application",
+        "captions",
+        "domain",
+        "journal"
+      ],
+      "verification": "python3 scripts/workflow_check.py --workflow multilingual-captions"
+    },
+    {
+      "id": "multilingual-delivery",
+      "name": "multilingual-delivery",
+      "entry": "GET /forge/v1/renders/{id}/bundle",
+      "success": "固定语言修订的旁挂字幕与说明",
+      "failure": "后续单语改稿不混入旧组",
+      "steps": [
+        "入口解码与领域事实读取",
+        "提交复制组修订与各语言修订，之后单语改稿不影响已提交组",
+        "固定语言修订的旁挂字幕与说明"
+      ],
+      "module_ids": [
+        "http",
+        "application",
+        "captions",
+        "encoding",
+        "inspection",
+        "objects",
+        "journal"
+      ],
+      "verification": "python3 scripts/workflow_check.py --workflow multilingual-delivery"
+    },
+    {
+      "id": "caption-burn",
+      "name": "caption-burn",
+      "entry": "POST /forge/v1/renders (burn_languages)",
+      "success": "可选烧录派生与未改动的清洁母版",
+      "failure": "缺少覆盖字体的语言烧录被拒",
+      "steps": [
+        "入口解码与领域事实读取",
+        "烧录由同一冻结字幕与检查通过母版生成独立派生，清洁母版保持不变",
+        "可选烧录派生与未改动的清洁母版"
+      ],
+      "module_ids": [
+        "http",
+        "application",
+        "captions",
+        "encoding",
+        "inspection",
+        "objects",
+        "journal"
+      ],
+      "verification": "python3 scripts/workflow_check.py --workflow caption-burn"
+    },
+    {
+      "id": "caption-failure",
+      "name": "caption-failure",
+      "entry": "GET /forge/v1/renders/{id}/artifact",
+      "success": "健康尝试仍可交付并可重试",
+      "failure": "部分字幕缺失令该次交付不可下载",
+      "steps": [
+        "入口解码与领域事实读取",
+        "缺失或改写的语言文件使该尝试核验失败，另一次尝试仍可解释与交付",
+        "健康尝试仍可交付并可重试"
+      ],
+      "module_ids": [
+        "http",
+        "application",
+        "inspection",
+        "objects",
+        "journal"
+      ],
+      "verification": "python3 scripts/workflow_check.py --workflow caption-failure"
     }
   ],
   "complexity": {
@@ -445,9 +529,10 @@
     "evidence": {
       "concurrency": "internal/service/worker.go:claim, completeLocked",
       "recovery_rollback": "internal/journal/recovery.go:Recover",
-      "time_semantics": "internal/timeline/plan.go:Build; internal/caption/map.go:Map",
+      "time_semantics": "internal/timeline/plan.go:Build; internal/caption/map.go:Map,AnalyseTrack",
       "idempotency": "internal/service/submit.go:Submit",
-      "snapshot_consistency": "internal/service/submit.go:Submit; internal/journal/store.go:Update"
+      "snapshot_consistency": "internal/service/submit.go:Submit,freezeCaptions; internal/service/captions.go:SaveCaptionGroup; internal/journal/store.go:Update",
+      "export_freeze": "internal/service/submit.go:freezeCaptions; internal/service/bundle.go:Bundle,captionReport"
     }
   }
 }

@@ -70,9 +70,43 @@ func (a API) artifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := render.Artifact.Filename
-	if r.URL.Query().Get("captions") == "1" {
+	switch r.URL.Query().Get("captions") {
+	case "":
+	case "1":
 		name = render.Artifact.CaptionFile
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	default:
+		if render.Plan.Captions == nil {
+			failure(w, domain.Conflict("render has no multilingual caption group"))
+			return
+		}
+		language, err := domain.CanonicalLanguage(r.URL.Query().Get("captions"))
+		if err != nil {
+			failure(w, domain.Invalid("captions must be 1 or a language tag"))
+			return
+		}
+		name = ""
+		for _, track := range render.Plan.Captions.Tracks {
+			if track.Language == language {
+				name = "captions." + language + ".vtt"
+			}
+		}
+		if name == "" {
+			failure(w, domain.Missing("caption language", language))
+			return
+		}
+		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	}
+	if r.URL.Query().Get("burned") == "1" {
+		if render.Artifact.BurnedFile == "" {
+			failure(w, domain.Conflict("render has no burned derivative"))
+			return
+		}
+		name = render.Artifact.BurnedFile
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		http.ServeFile(w, r, filepath.Join(dir, name))
+		return
 	}
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	http.ServeFile(w, r, filepath.Join(dir, name))

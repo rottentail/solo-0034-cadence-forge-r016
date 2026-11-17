@@ -41,6 +41,15 @@ type Sheet struct {
 	Cues      []Cue     `json:"cues"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+func (s Sheet) Duration() int64 {
+	var duration int64
+	for _, span := range s.Spans {
+		duration += span.OutMS - span.InMS
+	}
+	return duration
+}
+
 type Recipe struct {
 	ID         string  `json:"id"`
 	Revision   int     `json:"revision"`
@@ -66,4 +75,5 @@ type Plan struct {
 	Placements []Placement `json:"placements"`
 	Recipe     Recipe      `json:"recipe"`
 	VTT        string      `json:"vtt"`
+	Captions   *CaptionSet `json:"captions,omitempty"`
 }

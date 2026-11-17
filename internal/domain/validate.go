@@ -75,7 +75,7 @@ func ValidateSheet(s Sheet, sources map[string]Source) error {
 	return nil
 }
 func ValidateState(s State) error {
-	if s.Schema != 1 || s.Sources == nil || s.Sheets == nil || s.Recipes == nil || s.Renders == nil {
+	if s.Schema != 1 || s.Sources == nil || s.Sheets == nil || s.Recipes == nil || s.CaptionGroups == nil || s.CaptionTracks == nil || s.Renders == nil {
 		return fmt.Errorf("unsupported or incomplete state schema")
 	}
 	for id, source := range s.Sources {
@@ -109,6 +109,52 @@ func ValidateState(s State) error {
 			}
 		}
 	}
+	for id, versions := range s.CaptionGroups {
+		if len(versions) == 0 {
+			return fmt.Errorf("empty caption group history")
+		}
+		for i, v := range versions {
+			if v.ID != id || v.Revision != i+1 {
+				return fmt.Errorf("invalid caption group history")
+			}
+			if err := ValidateCaptionGroup(v); err != nil {
+				return err
+			}
+			if v.SheetRevision > len(s.Sheets[v.SheetID]) {
+				return fmt.Errorf("caption group %s targets a missing sheet revision", id)
+			}
+			for language, revision := range v.Languages {
+				tracks := s.CaptionTracks[id][language]
+				if revision > len(tracks) {
+					return fmt.Errorf("caption group %s pins a missing %s revision", id, language)
+				}
+				if track := tracks[revision-1]; track.SheetID != v.SheetID || track.SheetRevision != v.SheetRevision {
+					return fmt.Errorf("caption group %s pins %s against another picture edit", id, language)
+				}
+			}
+		}
+	}
+	for id, byLanguage := range s.CaptionTracks {
+		if _, ok := s.CaptionGroups[id]; !ok {
+			return fmt.Errorf("caption tracks without a group")
+		}
+		for language, tracks := range byLanguage {
+			if len(tracks) == 0 {
+				return fmt.Errorf("empty caption track history")
+			}
+			for i, track := range tracks {
+				if track.GroupID != id || track.Language != language || track.Revision != i+1 {
+					return fmt.Errorf("invalid caption track history")
+				}
+				if track.SheetRevision < 1 || track.SheetRevision > len(s.Sheets[track.SheetID]) {
+					return fmt.Errorf("caption track targets a missing sheet revision")
+				}
+				if err := ValidateCaptionTrack(track, s.Sheets[track.SheetID][track.SheetRevision-1].Duration()); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	keys := map[string]bool{}
 	for id, r := range s.Renders {
 		if id != r.ID || keys[r.Key] {
@@ -131,6 +177,11 @@ func ValidateState(s State) error {
 		}
 		if err := ValidateRecipe(r.Recipe); err != nil {
 			return err
+		}
+		if r.Plan.Captions != nil {
+			if err := ValidateCaptionSet(*r.Plan.Captions, r.Sheet); err != nil {
+				return err
+			}
 		}
 	}
 	var previous uint64

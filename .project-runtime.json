@@ -8,8 +8,8 @@
   "testing": "deferred",
   "runtime_dependencies": [
     "Go >= 1.24",
-    "FFmpeg with libx264, aac, loudnorm, showwavespic, tile",
-    "ffprobe"
+    "FFmpeg with libx264, aac, loudnorm, showwavespic, tile, subtitles (libass)",
+    "A font covering burned caption languages (FORGE_BURN_FONT)"
   ],
   "workflow_checks": [
     {
@@ -101,6 +101,26 @@
       "workflow_id": "events",
       "command": "python3 scripts/workflow_check.py --workflow events",
       "timeout_seconds": 120
+    },
+    {
+      "workflow_id": "multilingual-captions",
+      "command": "python3 scripts/workflow_check.py --workflow multilingual-captions",
+      "timeout_seconds": 180
+    },
+    {
+      "workflow_id": "multilingual-delivery",
+      "command": "python3 scripts/workflow_check.py --workflow multilingual-delivery",
+      "timeout_seconds": 180
+    },
+    {
+      "workflow_id": "caption-burn",
+      "command": "python3 scripts/workflow_check.py --workflow caption-burn",
+      "timeout_seconds": 180
+    },
+    {
+      "workflow_id": "caption-failure",
+      "command": "python3 scripts/workflow_check.py --workflow caption-failure",
+      "timeout_seconds": 180
     }
   ]
 }

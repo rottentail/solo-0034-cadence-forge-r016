@@ -43,12 +43,12 @@ func (a API) loudness(w http.ResponseWriter, r *http.Request) {
 }
 func expected(r *http.Request) (int, error) {
 	s := r.Header.Get("If-Match")
-	if s == "" && r.Method == "POST" {
+	if s == "" {
 		return 0, nil
 	}
 	n, err := strconv.Atoi(s)
-	if err != nil || n < 1 {
-		return 0, domain.Invalid("If-Match must be a positive revision")
+	if err != nil || n < 0 {
+		return 0, domain.Invalid("If-Match must be a non-negative revision")
 	}
 	return n, nil
 }

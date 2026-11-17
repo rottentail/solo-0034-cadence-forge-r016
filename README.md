@@ -4,14 +4,14 @@ Go HTTP 后端，以真实音视频字节为输入，提供版本化剪辑、字
 
 ## 运行
 
-需要 Go 1.24+、Python 3（仅运行有界工作流检查）及带 libx264、AAC、loudnorm、tile、showwavespic 的 FFmpeg/ffprobe。当前本机实际验证 Go 1.27、FFmpeg/ffprobe 9.0.2；Docker构建定义采用Go 1.24和Debian媒体包，镜像运行尚需目标环境独立验证。
+需要 Go 1.24+、Python 3（仅运行有界工作流检查）及带 libx264、AAC、loudnorm、tile、showwavespic、subtitles（libass）的 FFmpeg/ffprobe；可选烧录还需要覆盖目标语言的字体。当前本机实际验证 Go 1.27、FFmpeg/ffprobe 9.0.2；Docker构建定义采用Go 1.24和Debian媒体包，镜像运行尚需目标环境独立验证。
 
 ```sh
 go build -trimpath -o bin/forged ./cmd/forged
 ./bin/forged
 ```
 
-默认监听 `127.0.0.1:8734`，数据根 `var/cadence-forge`。可以设置 `FORGE_ADDR`、`FORGE_ROOT`、`FORGE_WORKERS`（1..8，默认2）、`FFMPEG_BIN`、`FFPROBE_BIN`。同一数据根仅允许一个服务进程。服务作为受信任环境中的媒体后端运行，面向公网接入前应部署认证和网络边界。
+默认监听 `127.0.0.1:8734`，数据根 `var/cadence-forge`。可以设置 `FORGE_ADDR`、`FORGE_ROOT`、`FORGE_WORKERS`（1..8，默认2）、`FFMPEG_BIN`、`FFPROBE_BIN`、`FORGE_BURN_FONT`。同一数据根仅允许一个服务进程。服务作为受信任环境中的媒体后端运行，面向公网接入前应部署认证和网络边界。
 
 使用现有媒体工具运行所有真实工作流：
 
@@ -19,7 +19,7 @@ go build -trimpath -o bin/forged ./cmd/forged
 python3 scripts/workflow_check.py --workflow all
 ```
 
-检查在临时数据根内生成4秒校准音画，不依赖外部素材或在线服务，完成18条工作流，包括真实强制终止及恢复。`--workflow`可选择运行清单中的某条工作流；所需的前置接收、版本编辑和渲染也会执行。初始化基线不含自动测试套件，testing为deferred；这里提供有界生产工作流核验，不声明测试命令。
+检查在临时数据根内生成4秒校准音画，不依赖外部素材或在线服务，完成22条工作流，包括重复源重排的多语言字幕组、可选烧录、部分字幕文件缺失、真实强制终止及恢复。`--workflow`可选择运行清单中的某条工作流；所需的前置接收、版本编辑和渲染也会执行。初始化基线不含自动测试套件，testing为deferred；这里提供有界生产工作流核验，不声明测试命令。
 
 ## 调用顺序
 
@@ -29,7 +29,30 @@ python3 scripts/workflow_check.py --workflow all
 4. `GET /forge/v1/sheets/{id}/preview?recipe_id={id}`：预览当前最新修订的累计区间及WebVTT。片段按半开区间求交；同源重复出现分别映射。
 5. `POST /forge/v1/renders`：提供 `Idempotency-Key`，正文 `{"sheet_id":"剪辑ID","sheet_revision":1,"recipe_id":"配方ID","recipe_revision":1}`。必须显式选择修订，提交冻结引用与时间计划；预览最新版本不替代提交选择。
 6. `GET /forge/v1/renders/{id}`：查看排队、运行、成功、失败或取消及尝试历史。
-7. `GET /forge/v1/renders/{id}/artifact`：下载检验通过的媒体；`?captions=1`下载字幕。`POST .../verify`重新核验；`GET .../bundle`返回媒体、字幕及冻结说明组成的ZIP。
+7. `GET /forge/v1/renders/{id}/artifact`：下载检验通过的媒体；`?captions=1`下载默认字幕，多语言渲染用 `?captions=<language>` 选语言，`?burned=1` 下载可选烧录派生。`POST .../verify`重新核验；`GET .../bundle`返回媒体、字幕、可选烧录派生及冻结说明组成的ZIP。
+
+## 多语言字幕组
+
+同一剪辑可以有多个语言字幕组。每个语言独立保存修订，组修订把一次确认画面编排与各语言的精确修订固定在一起；正式交付只使用组修订里固定的语言修订。
+
+```sh
+# 创建组（草稿可为空语言），再逐语言保存
+curl -X POST localhost:8734/forge/v1/caption-groups \
+  -d '{"name":"交付字幕","sheet_id":"剪辑ID","sheet_revision":1,"languages":{}}'
+curl -X PUT localhost:8734/forge/v1/caption-groups/组ID/languages/zh-Hans \
+  -H 'If-Match: 0' \
+  -d '{"sheet_id":"剪辑ID","sheet_revision":1,"cues":[{"start_ms":100,"end_ms":1400,"text":"完整句子"}]}'
+curl -X PUT localhost:8734/forge/v1/caption-groups/组ID \
+  -H 'If-Match: 1' \
+  -d '{"name":"交付字幕","sheet_id":"剪辑ID","sheet_revision":1,"languages":{"zh-Hans":1,"en":1}}'
+```
+
+- 语言字幕使用**成片累计时间**，与源字幕的区间求交不同。完整语句可以跨过任意切点，不会按镜头切分；只有超出片尾的显示区间会被截短，并记录 `cue_clipped` 说明。
+- 分句由各语言编辑独立完成。阅读检查（语速、单行宽度、行数、过短显示）只报告 `reading_rate`、`line_too_wide`、`too_many_lines`、`short_display` 等发现，**不删字、不换行重排、不统一缩小字号**。
+- 组修订固定 `sheet_revision` 与每个语言的修订号。提交渲染时复制这些精确修订；之后任何单语改稿都不会改变已发布组或已提交渲染。`GET /caption-groups/{id}` 会指出哪个语言有更新修订、组是否落后于新剪辑，但不会自动跟随。
+- 提交渲染可选择组：`{"caption_group":"组ID","caption_revision":2}`，旁挂字幕按语言分别输出 `captions.<language>.vtt`，包内同时包含所有语言与每条的说明。
+- 可选烧录用 `"burn_languages":["zh-Hans","en"]`，最多两种语言并上下分层以免互相遮挡；烧录文件是独立派生 `composition.burned.mp4`，清洁母版保持不变。烧录与旁挂来自同一冻结字幕。
+- 烧录字体由 `FORGE_BURN_FONT` 选择。内置默认只覆盖拉丁字形；含中日韩文字的语言在未显式选择覆盖字体时提交会被拒绝（409），而不是烧出缺字。`scripts/workflow_check.py` 默认用英文验证烧录，设置该变量后可用中文验证。
 
 ## 编辑与恢复
 
@@ -45,7 +68,7 @@ python3 scripts/workflow_check.py --workflow all
 
 ## 支持范围与限制
 
-单素材最多64 MiB、约120秒、3840×2160和8声道。剪辑最多32段、120秒、500条字幕，段长至少100ms；输出MP4/H.264/AAC或WAV/16位PCM，采样率44.1或48kHz。MP4要求每段有视频；无声视频生成对应静音。WAV要求每段有声音。视频保持完整画面并留边，统一像素比例与帧率，声音统一立体声。归一化为单遍响度滤镜，不保证任何短片都精确达到目标值。
+单素材最多64 MiB、约120秒、3840×2160和8声道。剪辑最多32段、120秒、500条字幕，段长至少100ms；多语言组最多8种语言，每种语言1..500条成片时间字幕且同一语言内不得重叠，烧录最多2种语言；输出MP4/H.264/AAC或WAV/16位PCM，采样率44.1或48kHz。MP4要求每段有视频；无声视频生成对应静音。WAV要求每段有声音。视频保持完整画面并留边，统一像素比例与帧率，声音统一立体声。归一化为单遍响度滤镜，不保证任何短片都精确达到目标值。
 
 时长基准为毫秒，编码后的帧与采样可能有容差。检验检查流、尺寸、采样率、时长与摘要，不代表内容正确、逐帧同步或主观质量已通过人工审片。禁止容器中的远程协议与非白名单封装，但媒体进程仍需要部署侧隔离。
 

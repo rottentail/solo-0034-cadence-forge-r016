@@ -40,6 +40,8 @@ def main():
         address = 'http://127.0.0.1:'+str(port)+'/forge/v1'
         env = dict(os.environ, FORGE_ROOT=str(scratch/'data'),
                    FORGE_ADDR='127.0.0.1:'+str(port), FORGE_WORKERS='1')
+        burn_font = os.environ.get('FORGE_BURN_FONT', '')
+        burn_language = os.environ.get('FORGE_CAPTION_BURN_LANGUAGE', 'zh-Hans' if burn_font else 'en')
         log = open(scratch/'server.log', 'ab')
         process = None
         def request(method, route, body=None, headers=None, status=200, raw=False):
@@ -124,6 +126,179 @@ def main():
             need('00:00:01.500 --> 00:00:02.000' in plan['vtt'], 'second caption mapping mismatch')
             need('&lt;幅度&gt;' in plan['vtt'], 'caption markup not escaped')
             observe('captions', 'source cue split and clipped into two escaped output intervals')
+            if args.workflow in ('all', 'multilingual-captions', 'multilingual-delivery', 'caption-burn', 'caption-failure'):
+                # A repeated source is re-ordered into three cuts. The Chinese
+                # sentence deliberately crosses two of them; English is segmented
+                # independently. Both must point at the same confirmed picture.
+                multi_sheet_body = dict(name='multilingual-cut', spans=[
+                    dict(source_id=sid, in_ms=0, out_ms=1200, gain_db=0),
+                    dict(source_id=sid, in_ms=1200, out_ms=2600, gain_db=0),
+                    dict(source_id=sid, in_ms=0, out_ms=600, gain_db=0)], cues=[])
+                multi_sheet = request('POST', '/sheets', multi_sheet_body, status=201)['id']
+                request('PUT', '/sheets/'+multi_sheet, dict(multi_sheet_body, name='multilingual-cut-v2'),
+                        {'If-Match': '1'}, status=201)
+                group = request('POST', '/caption-groups',
+                                dict(name='delivery-languages', sheet_id=multi_sheet, sheet_revision=1, languages={}), status=201)
+                gid = group['id']
+                zh = request('PUT', f'/caption-groups/{gid}/languages/zh-Hans',
+                             dict(sheet_id=multi_sheet, sheet_revision=1, cues=[
+                                 dict(start_ms=100, end_ms=1400, text='第一句完整保留'),
+                                 dict(start_ms=1400, end_ms=3400, text='第二句跨越切点也完整')]),
+                             {'If-Match': '0'}, status=201)
+                en = request('PUT', f'/caption-groups/{gid}/languages/en',
+                             dict(sheet_id=multi_sheet, sheet_revision=1, cues=[
+                                 dict(start_ms=100, end_ms=1400, text='The first sentence stays whole.'),
+                                 dict(start_ms=1400, end_ms=2900, text='The second sentence crosses the cuts.')]),
+                             {'If-Match': '0'}, status=201)
+                need(zh['revision'] == 1 and en['revision'] == 1, 'language revisions not independent')
+                request('PUT', f'/caption-groups/{gid}/languages/en',
+                        dict(sheet_id=multi_sheet, sheet_revision=1, cues=[
+                            dict(start_ms=0, end_ms=900, text='a'), dict(start_ms=800, end_ms=1200, text='b')]),
+                        {'If-Match': '1'}, status=400)
+                published = request('PUT', f'/caption-groups/{gid}',
+                                    dict(name='delivery-languages', sheet_id=multi_sheet, sheet_revision=1,
+                                         languages={'zh-Hans': 1, 'en': 1}),
+                                    {'If-Match': '1'}, status=201)
+                need(published['revision'] == 2, 'group revision not advanced')
+                view = request('GET', f'/caption-groups/{gid}')
+                need(view['group']['languages'] == {'en': 1, 'zh-Hans': 1}, 'group did not pin both languages')
+                need(set(view['tracks']) == {'en', 'zh-Hans'}, 'group view lost a language')
+                need('00:00:01.400 --> 00:00:03.200' in view['tracks']['zh-Hans']['vtt'],
+                     'composition-timed cue was split at a cut or clipped')
+                need(any(f['code'] == 'cue_clipped' for f in view['tracks']['zh-Hans']['findings']),
+                     'overrun past the composition end was not explained')
+                need(any(f['code'] == 'reading_rate' for f in view['tracks']['en']['findings']),
+                     'unreadable English cue was not reported')
+                request('PUT', f'/caption-groups/{gid}/languages/en',
+                        dict(sheet_id=multi_sheet, sheet_revision=1, cues=[
+                            dict(start_ms=100, end_ms=1400, text='Edited after publication.')]),
+                        {'If-Match': '1'}, status=201)
+                after = request('GET', f'/caption-groups/{gid}')
+                need(after['group']['languages']['en'] == 1, 'monolingual edit changed a published group')
+                need(after['tracks']['en']['track']['revision'] == 1, 'group view followed the later edit')
+                need(any(p['code'] == 'newer_language_revision' for p in after['problems']),
+                     'newer language revision was not explained')
+                observe('multilingual-captions',
+                        'repeated source re-ordered into three cuts; zh-Hans sentence crosses cuts without splitting; '
+                        'English segmented independently; published group keeps pinned revisions after a later edit')
+                multi_req = dict(sheet_id=multi_sheet, sheet_revision=1, recipe_id=rp, recipe_revision=1)
+                no_burn = request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2),
+                                  {'Idempotency-Key': 'multi-sidecar'}, status=202)['id']
+                sidecar_done = wait_render(no_burn)
+                need(sidecar_done['state'] == 'succeeded', str(sidecar_done['attempts']))
+                need(sidecar_done['artifact']['caption_files'] == ['captions.en.vtt', 'captions.zh-Hans.vtt'],
+                     'sidecar language set mismatch')
+                need(sidecar_done['artifact']['caption_file'] == 'captions.en.vtt', 'no default sidecar chosen')
+                en_vtt = request('GET', f'/renders/{no_burn}/artifact?captions=en', raw=True)
+                need(b'The first sentence stays whole.' in en_vtt, 'pinned English text drifted')
+                need(b'Edited after publication.' not in en_vtt, 'later monolingual edit leaked into the group')
+                zh_vtt = request('GET', f'/renders/{no_burn}/artifact?captions=zh-Hans', raw=True)
+                need('第二句跨越切点也完整'.encode() in zh_vtt, 'Chinese sentence was truncated')
+                with zipfile.ZipFile(io.BytesIO(request('GET', f'/renders/{no_burn}/bundle', raw=True))) as z:
+                    need({'composition.mp4', 'captions.en.vtt', 'captions.zh-Hans.vtt', 'composition.json'} <= set(z.namelist()),
+                         'bundle lost a language')
+                    manifest = json.loads(z.read('composition.json'))
+                    need(manifest['plan']['captions']['group_revision'] == 2, 'bundle followed a later group')
+                    pinned = {t['language']: t['revision'] for t in manifest['plan']['captions']['tracks']}
+                    need(pinned == {'en': 1, 'zh-Hans': 1}, 'bundle pinned the wrong language revisions')
+                    report = {r['language']: r for r in manifest['caption_report']}
+                    need(any(f['code'] == 'reading_rate' for f in report['en']['findings']),
+                         'bundle did not explain the unreadable translation')
+                    need(report['zh-Hans']['findings'] and
+                         any(f['code'] == 'cue_clipped' for f in report['zh-Hans']['findings']),
+                         'bundle did not explain the clipped display window')
+                observe('multilingual-delivery',
+                        'sidecars and bundle export the pinned language revisions; later single-language edit does not leak in')
+                if args.workflow in ('all', 'caption-burn'):
+                    # Burning CJK without an operator-chosen font that covers the
+                    # script must fail visibly rather than render missing glyphs.
+                    if not burn_font:
+                        request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2,
+                                                         burn_languages=['zh-Hans']),
+                                {'Idempotency-Key': 'burn-cjk-default'}, status=409)
+                    burn_req = dict(multi_req, caption_group=gid, caption_revision=2,
+                                    burn_languages=[burn_language])
+                    burn = request('POST', '/renders', burn_req,
+                                   {'Idempotency-Key': 'multi-burn'}, status=202)['id']
+                    burn_done = wait_render(burn)
+                    need(burn_done['state'] == 'succeeded', str(burn_done['attempts']))
+                    need(burn_done['artifact']['burned_file'] == 'composition.burned.mp4', 'no burned derivative')
+                    clean = request('GET', f'/renders/{burn}/artifact', raw=True)
+                    burned = request('GET', f'/renders/{burn}/artifact?burned=1', raw=True)
+                    need(len(clean) > 0 and len(burned) > 0 and clean != burned, 'burn derivative equals clean master')
+                    verification = request('POST', f'/renders/{burn}/verify')
+                    need(verification['digest'] == burn_done['artifact']['inspection']['digest'],
+                         'clean master changed when burning')
+                    observe('caption-burn',
+                            ('CJK burn refused on the Latin-only default font; ' if not burn_font else 'explicit font configured; ') +
+                            'the MP4 burn is a separate derivative of the same frozen cues and the clean master is unchanged')
+                if args.workflow in ('all', 'caption-failure'):
+                    wav_recipe = request('POST', '/recipes', dict(recipe_body, name='caption-audio', format='wav'),
+                                         status=201)['id']
+                    request('POST', '/renders', dict(multi_req, recipe_id=wav_recipe, caption_group=gid,
+                                                     caption_revision=2, burn_languages=['en']),
+                            {'Idempotency-Key': 'burn-wav'}, status=400)
+                    request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2,
+                                                     burn_languages=['fr']),
+                            {'Idempotency-Key': 'burn-unknown'}, status=400)
+                    request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2),
+                            {'Idempotency-Key': 'multi-sidecar'}, status=202)
+                    request('POST', '/renders', dict(multi_req, sheet_revision=2, caption_group=gid,
+                                                     caption_revision=2),
+                            {'Idempotency-Key': 'multi-cut-rev'}, status=409)
+                    # Partial failure: deleting one pinned language file must fail
+                    # the whole delivery, leave the render's explanation intact,
+                    # and still name which group revision is not deliverable.
+                    damaged = request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2),
+                                      {'Idempotency-Key': 'multi-damaged'}, status=202)['id']
+                    damaged_done = wait_render(damaged)
+                    need(damaged_done['state'] == 'succeeded', 'damaged-delivery setup failed')
+                    damaged_dir = scratch/'data'/'renders'/f'{damaged}-1'
+                    (damaged_dir/'captions.en.vtt').unlink()
+                    request('POST', f'/renders/{damaged}/verify', status=500)
+                    request('GET', f'/renders/{damaged}/bundle', status=500)
+                    request('GET', f'/renders/{damaged}/artifact?captions=en', status=500)
+                    request('GET', f'/renders/{damaged}/artifact?captions=zh-Hans', status=500)
+                    recovered = request('POST', f'/renders/{damaged}/retry', status=409)
+                    need(recovered['error'] == 'conflict', 'succeeded render accepted a retry')
+                    healthy = request('POST', '/renders', dict(multi_req, caption_group=gid, caption_revision=2),
+                                      {'Idempotency-Key': 'multi-healthy'}, status=202)['id']
+                    healthy_done = wait_render(healthy)
+                    need(healthy_done['state'] == 'succeeded', str(healthy_done['attempts']))
+                    request('POST', f'/renders/{healthy}/verify')
+                    # A killed caption attempt must recover as interrupted, keep
+                    # its frozen group, and only the retried attempt may deliver.
+                    long_sheet = request('POST', '/sheets', dict(name='caption-interrupt', spans=multi_sheet_body['spans'] * 10, cues=[]), status=201)['id']
+                    retry_group = request('POST', '/caption-groups', dict(name='retry-group', sheet_id=long_sheet, sheet_revision=1, languages={}), status=201)['id']
+                    request('PUT', f'/caption-groups/{retry_group}/languages/en',
+                                          dict(sheet_id=long_sheet, sheet_revision=1,
+                                               cues=[dict(start_ms=0, end_ms=2000, text='Frozen before interruption.')]),
+                                          {'If-Match': '0'}, status=201)
+                    request('PUT', f'/caption-groups/{retry_group}',
+                            dict(name='retry-group', sheet_id=long_sheet, sheet_revision=1, languages={'en': 1}),
+                            {'If-Match': '1'}, status=201)
+                    killed = request('POST', '/renders', dict(sheet_id=long_sheet, sheet_revision=1,
+                                                              recipe_id=rp, recipe_revision=1,
+                                                              caption_group=retry_group, caption_revision=2),
+                                     {'Idempotency-Key': 'caption-interrupt'}, status=202)['id']
+                    wait_render(killed, 'running')
+                    stop(force=True)
+                    start()
+                    recovered = request('GET', '/renders/'+killed)
+                    need(recovered['state'] == 'failed' and recovered['attempts'][-1]['outcome'] == 'interrupted',
+                         'caption recovery provenance mismatch')
+                    need(recovered['plan']['captions']['group_id'] == retry_group, 'interrupted attempt lost its frozen group')
+                    request('POST', f'/renders/{killed}/retry', status=202)
+                    retried = wait_render(killed)
+                    need(retried['state'] == 'succeeded' and len(retried['attempts']) == 2, str(retried['attempts']))
+                    need(retried['artifact']['caption_files'] == ['captions.en.vtt'], 'retry did not keep the pinned language')
+                    en_after_retry = request('GET', f'/renders/{killed}/artifact?captions=en', raw=True)
+                    need(b'Frozen before interruption.' in en_after_retry, 'retry changed the frozen caption text')
+                    request('POST', f'/renders/{killed}/verify')
+                    observe('caption-failure',
+                            'unrequested burn language, audio-only recipe burn and wrong picture revision are rejected; '
+                            'a missing language file makes only that attempt undeliverable; '
+                            'a killed caption attempt recovers as interrupted and its retry reuses the pinned group')
             if args.workflow in ('all', 'loudness'):
                 loud = request('POST', '/sources/'+sid+'/loudness')
                 need(loud['integrated_lufs'] is not None and not loud['silent'], 'loudness scan failed')

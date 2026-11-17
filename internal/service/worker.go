@@ -118,17 +118,31 @@ func (s *Service) execute(ctx context.Context, r domain.Render) {
 		}
 	}
 	runner := encoding.Runner{Binary: s.Config.FFmpeg, Blobs: s.Blobs}
-	name, err := runner.Encode(ctx, r, stage)
+	plan, err := runner.Encode(ctx, r, stage)
 	if err != nil {
 		s.complete(r, nil, err)
 		return
 	}
-	inspection, err := inspect.Artifact(ctx, s.Probe, filepath.Join(stage, name), r)
+	inspection, err := inspect.Artifact(ctx, s.Probe, filepath.Join(stage, plan.MediaName), r)
 	if err != nil {
 		s.complete(r, nil, err)
 		return
 	}
-	artifact := &domain.Artifact{Filename: name, CaptionFile: "captions.vtt", Inspection: inspection}
+	artifact := &domain.Artifact{Filename: plan.MediaName, CaptionFile: "captions.vtt", Inspection: inspection}
+	if r.Plan.Captions != nil {
+		artifact.CaptionFiles = plan.Captions
+		artifact.CaptionFile = primaryCaption(plan, r)
+	}
+	if plan.BurnedName != "" && len(r.Plan.Captions.BurnLanguages) > 0 {
+		burned, err := inspect.Artifact(ctx, s.Probe, filepath.Join(stage, plan.BurnedName), r)
+		if err != nil {
+			s.complete(r, nil, fmt.Errorf("burned derivative failed inspection: %w", err))
+			return
+		}
+		artifact.BurnedFile = plan.BurnedName
+		artifact.BurnedLanguages = append([]string(nil), r.Plan.Captions.BurnLanguages...)
+		artifact.BurnedInspection = &burned
+	}
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
 	st, err := s.Store.Snapshot()
@@ -146,6 +160,18 @@ func (s *Service) execute(ctx context.Context, r domain.Render) {
 	}
 	s.completeLocked(r, artifact, nil)
 }
+func primaryCaption(plan encoding.Plan, r domain.Render) string {
+	for _, track := range r.Plan.Captions.Tracks {
+		if len(r.Plan.Captions.BurnLanguages) > 0 && track.Language == r.Plan.Captions.BurnLanguages[0] {
+			return "captions." + track.Language + ".vtt"
+		}
+	}
+	if len(plan.Captions) > 0 {
+		return plan.Captions[0]
+	}
+	return ""
+}
+
 func (s *Service) complete(r domain.Render, a *domain.Artifact, cause error) {
 	s.mutation.Lock()
 	defer s.mutation.Unlock()
